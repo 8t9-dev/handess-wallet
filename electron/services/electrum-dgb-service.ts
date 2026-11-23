@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import ElectrumClient from '@keep-network/electrum-client-js';
-import { patchElectrumClientNotifications } from './electrum-client-compat';
+import { connectElectrumClient, patchElectrumClientNotifications } from './electrum-client-compat';
 import type { DgbBalance, DgbUtxo, DgbNetworkType } from '../../src/types/swap';
 import { getDgbNetwork, toBitcoinJsNetwork } from '../dgb-networks';
 
@@ -45,7 +45,7 @@ export class ElectrumDgbService {
     try {
       this.client = new ElectrumClient(electrumHost, electrumPort, useSsl ? 'tls' : 'tcp');
       patchElectrumClientNotifications(this.client);
-      await this.client.connect('bob-wallet-crm', '1.4');
+      await connectElectrumClient(this.client, 'bob-wallet-crm', '1.4');
 
       // A server can be reachable while being on the wrong chain. Verify the
       // genesis hash before deriving addresses or querying balances.
