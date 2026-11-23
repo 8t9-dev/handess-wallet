@@ -1,0 +1,74 @@
+/**
+ * Global styles and Tailwind CSS imports.
+ *
+ * The @tailwind directives inject Tailwind's base, component,
+ * and utility styles. Custom global styles go below.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   Custom Base Styles
+   ============================================================ */
+
+@layer base {
+  /* Smooth font rendering */
+  body {
+    @apply antialiased;
+    font-feature-settings: 'liga' 1, 'calt' 1;
+  }
+
+  /* Scrollbar styling for domain tables */
+  ::-webkit-scrollbar {
+    @apply w-2 h-2;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-gray-100 dark:bg-gray-800;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-300 dark:bg-gray-600 rounded;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-400 dark:bg-gray-500;
+  }
+}
+
+/* ============================================================
+   Custom Component Styles
+   ============================================================ */
+
+@layer components {
+  /* Sidebar navigation link */
+  .nav-link {
+    @apply flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium
+           text-gray-600 dark:text-gray-400
+           hover:bg-gray-100 dark:hover:bg-gray-800
+           hover:text-gray-900 dark:hover:text-gray-100
+           transition-colors duration-150;
+  }
+
+  .nav-link.active {
+    @apply bg-hns-50 dark:bg-hns-900/30
+           text-hns-700 dark:text-hns-300;
+  }
+
+  /* Domain state badge */
+  .state-badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  /* Card container */
+  .card {
+    @apply bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6;
+  }
+
+  /* Table container */
+  .table-container {
+    @apply bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-x-auto;
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "composite": true,
+    "outDir": "./out/main",
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": [
+    "electron/**/*.ts",
+    "electron-vite.config.ts",
+    "src/types/**/*.ts",
+    "src/lib/**/*.ts"
+  ],
+  "exclude": [
+    "src/lib/connection-config-migration.ts",
+    "src/lib/export-utils.ts",
+    "src/lib/hsd-api.ts",
+    "src/lib/__tests__/**"
+  ]
+}
