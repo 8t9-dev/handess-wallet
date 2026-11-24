@@ -12,6 +12,11 @@ import {
   isListingExpired,
 } from '../lib/marketplace-signing';
 import { isValidHnsAddress } from '../lib/address-utils';
+import {
+  canPaySeller,
+  effectivePurchaseStatus,
+  shouldTrackTransfer,
+} from '../lib/marketplace-purchase';
 import { PassphraseModal } from '../components/common/PassphraseModal';
 import { ListingDetailModal } from '../components/marketplace/ListingDetailModal';
 import { EscrowTradeModal } from '../components/marketplace/EscrowTradeModal';
@@ -297,7 +302,7 @@ export function Marketplace() {
       await fetchMyPurchases();
       const purchases = useMarketplaceStore.getState().myPurchases;
       for (const intent of purchases) {
-        if (intent.status !== 'transferred' && intent.status !== 'paid') continue;
+        if (!shouldTrackTransfer(intent)) continue;
         const status = await checkTransferStatus(
           intent.name,
           intent.buyerAddr,
@@ -623,14 +628,14 @@ export function Marketplace() {
 
   const requestPay = (intent: PurchaseIntent) => {
     const status = transferStatus[purchaseKey(intent)];
+    if (status?.cancelled) {
+      setError('The seller cancelled the transfer.');
+      return;
+    }
     if (!status?.transferred && !status?.finalized) {
       setError(
         'The name transfer has not been detected on-chain yet. Wait for it to confirm, then try again.',
       );
-      return;
-    }
-    if (status.cancelled) {
-      setError('The seller cancelled the transfer.');
       return;
     }
     if (needsPassphrase) {
@@ -1626,11 +1631,16 @@ export function Marketplace() {
                   const key = purchaseKey(intent);
                   const status = transferStatus[key];
                   const isEscrow = Boolean(intent.escrow);
-                  const canFinalize = (intent.status === 'paid' || (isEscrow && intent.status === 'transferred'))
+                  const displayStatus = effectivePurchaseStatus(intent, status);
+                  const payEnabled = canPaySeller(intent, status);
+                  const showPay = !isEscrow
+                    && (intent.status === 'pending' || intent.status === 'transferred');
+                  const escrowTransferDetected = isEscrow
+                    && Boolean(status?.transferred || intent.status === 'transferred');
+                  const canFinalize = (intent.status === 'paid' || escrowTransferDetected)
                     && status?.finalized !== true
                     && (status?.blocksRemaining ?? 1) <= 0;
-                  const showFinalize = intent.status === 'paid'
-                    || (isEscrow && intent.status === 'transferred');
+                  const showFinalize = intent.status === 'paid' || escrowTransferDetected;
                   return (
                     <tr key={key} className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                       <td className="px-4 py-3 font-medium">
@@ -1657,8 +1667,8 @@ export function Marketplace() {
                       </td>
                       <td className="px-4 py-3 text-xs font-mono text-gray-500">{shortAddr(intent.sellerAddr)}</td>
                       <td className="px-4 py-3">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${PURCHASE_STATUS_COLORS[intent.status]}`}>
-                          {PURCHASE_STATUS_LABELS[intent.status]}
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${PURCHASE_STATUS_COLORS[displayStatus]}`}>
+                          {PURCHASE_STATUS_LABELS[displayStatus]}
                         </span>
                         {isEscrow && intent.escrow && intent.status !== 'sold' && intent.status !== 'cancelled' && (
                           <span className="mt-1 block text-[10px] text-gray-500 capitalize">
@@ -1667,22 +1677,26 @@ export function Marketplace() {
                         )}
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-500 max-w-xs">
-                        {isEscrow && intent.status === 'pending'
-                          ? intent.escrow?.state === 'created'
-                            ? 'Fund the escrow to start the transfer.'
-                            : 'Escrow funded — waiting for the seller to transfer.'
-                          : intent.status === 'transferred' || intent.status === 'paid'
+                        {displayStatus === 'pending'
+                          ? isEscrow
+                            ? intent.escrow?.state === 'created'
+                              ? 'Fund the escrow to start the transfer.'
+                              : 'Escrow funded — waiting for the seller to transfer.'
+                            : 'Waiting for on-chain transfer…'
+                          : displayStatus === 'transferred' || displayStatus === 'paid'
                             ? formatLockup(status)
-                            : intent.status === 'sold'
+                            : displayStatus === 'sold'
                               ? isEscrow
                                 ? intent.escrow?.state === 'released'
                                   ? 'Finalized — escrow released'
                                   : 'Finalized — release escrow'
                                 : 'Finalized'
-                              : intent.status === 'cancelled'
-                                ? isEscrow && intent.escrow?.state === 'refunded'
-                                  ? 'Cancelled — escrow refunded'
-                                  : 'Cancelled'
+                              : displayStatus === 'cancelled'
+                                ? status?.cancelled
+                                  ? 'Seller cancelled or transferred elsewhere.'
+                                  : isEscrow && intent.escrow?.state === 'refunded'
+                                    ? 'Cancelled — escrow refunded'
+                                    : 'Cancelled'
                                 : '—'}
                       </td>
                       <td className="px-4 py-3">
@@ -1698,17 +1712,17 @@ export function Marketplace() {
                                   : 'Manage escrow'}
                             </button>
                           )}
-                          {!isEscrow && intent.status === 'transferred' && !status?.cancelled && (
+                          {showPay && !status?.cancelled && (
                             <button onClick={() => requestPay(intent)}
-                              disabled={busy || (!status?.transferred && !status?.finalized)}
-                              title={status?.transferred || status?.finalized
+                              disabled={busy || !payEnabled}
+                              title={payEnabled
                                 ? 'Pay the seller'
                                 : 'Waiting for the name transfer to confirm on-chain'}
                               className="text-xs px-3 py-1.5 bg-hns-600 text-white rounded hover:bg-hns-700 disabled:opacity-50">
-                              {status?.transferred || status?.finalized ? 'Pay seller' : 'Waiting for transfer'}
+                              {payEnabled ? 'Pay seller' : 'Waiting for transfer'}
                             </button>
                           )}
-                          {!isEscrow && intent.status === 'transferred' && status?.cancelled && (
+                          {!isEscrow && status?.cancelled && (
                             <span className="text-xs text-red-600">Seller cancelled</span>
                           )}
                           {showFinalize && status?.finalized !== true && (
@@ -1732,9 +1746,10 @@ export function Marketplace() {
             </table>
           )}
           <div className="p-3 text-xs text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-b-lg">
-            Purchases are saved locally and synced with the seller&apos;s Nostr status updates. Transfer-first
-            payments are not trustless: the seller can cancel before you finalize. Escrow trades use a 2-of-3
-            address with an independent arbiter and release only after finalization.
+            Transfer status is read from the Handshake chain, so payment becomes available even if a seller
+            status update is missed. Transfer-first payments are not trustless: the seller can cancel before
+            you finalize. Escrow trades use a 2-of-3 address with an independent arbiter and release only
+            after finalization.
           </div>
         </div>
       )}

@@ -641,7 +641,7 @@ export class NodeService {
         const vInfo = nameInfo?.info as Record<string, unknown> | null;
         const owner = vInfo?.owner as Record<string, unknown> | null;
         if (!owner || !owner.hash) throw new Error('Cannot find the name owner.');
-        const coin = await nodeClient.execute('getcoin', [owner.hash, owner.index]) as Record<string, unknown> | null;
+        const coin = await nodeClient.getCoin(String(owner.hash), Number(owner.index)) as Record<string, unknown> | null;
         if (!coin?.address) throw new Error('Cannot find the owner address.');
         const result = await nodeClient.execute('verifymessage', [coin.address, signature, message]);
         return Boolean(result);

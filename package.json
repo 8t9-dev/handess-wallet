@@ -1,6 +1,6 @@
 {
   "name": "handshake-wallet",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "description": "Handess Wallet - Handshake desktop wallet",
   "main": "./out/main/main.js",
   "homepage": "https://github.com/8t9-dev/handess-wallet",

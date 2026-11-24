@@ -34,3 +34,40 @@ export function isValidHnsAddress(address: string): boolean {
 export function normalizeHnsAddress(address: string): string {
   return typeof address === 'string' ? address.trim() : '';
 }
+
+/**
+ * Check a Handshake covenant's address fields against a bech32 address.
+ *
+ * A TRANSFER covenant stores the intended recipient as `[nameHash, height,
+ * version, hash]`. The transfer output itself pays the seller, so the recipient
+ * must be read from these items rather than from `output.address`.
+ */
+export function covenantItemsMatchAddress(
+  items: unknown,
+  address: string,
+): boolean {
+  if (!Array.isArray(items) || items.length < 4) return false;
+
+  const versionItem = items[2];
+  const hashItem = items[3];
+  if (typeof versionItem !== 'string' || typeof hashItem !== 'string') return false;
+
+  const version = Number.parseInt(versionItem, 16);
+  if (!Number.isInteger(version) || version < 0 || version > 31) return false;
+
+  const programHex = hashItem.toLowerCase();
+  if (!/^[0-9a-f]+$/.test(programHex) || programHex.length % 2 !== 0) return false;
+
+  try {
+    const decoded = bech32.decode(address.trim(), 90);
+    if (decoded.words[0] !== version) return false;
+
+    const program = bech32.fromWords(decoded.words.slice(1));
+    const decodedHex = program
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    return decodedHex === programHex;
+  } catch {
+    return false;
+  }
+}

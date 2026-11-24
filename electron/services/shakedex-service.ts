@@ -20,7 +20,11 @@ import {
   isEscrowListing,
   isListingExpired,
 } from '../../src/lib/marketplace-signing';
-import { isValidHnsAddress, normalizeHnsAddress } from '../../src/lib/address-utils';
+import {
+  covenantItemsMatchAddress,
+  isValidHnsAddress,
+  normalizeHnsAddress,
+} from '../../src/lib/address-utils';
 import {
   ESCROW_FEE_BUFFER,
   buildEscrowRedeemScript,
@@ -1251,39 +1255,156 @@ export class MarketplaceService {
 
       const state = String(info.state || '');
       const transferHeight = Number(info.transfer) || 0;
+      const owner = info.owner as { hash?: string; index?: number } | undefined;
+      const nameHash = String(info.nameHash || '').toLowerCase();
 
-      // Locate the seller's transfer transaction first. A normal owned name is
-      // CLOSED until its TRANSFER is mined; CLOSED alone is not a cancellation.
-      let matchedTxHash = transferTxHash || '';
-      let matched = false;
-      let transferConfirmed = false;
+      const inspectTransferTx = async (
+        hash: string,
+      ): Promise<{ hash: string; tx: Record<string, unknown>; matchesBuyer: boolean } | null> => {
+        if (!hash) return null;
+        const tx = await this.walletService.getTransaction(hash);
+        if (!tx || !Array.isArray(tx.outputs)) return null;
 
-      if (matchedTxHash) {
-        const tx = await this.walletService.getTransaction(matchedTxHash);
-        if (tx && Array.isArray(tx.outputs)) {
-          matched = (tx.outputs as Array<Record<string, unknown>>).some((output) => {
+        const transferOutputs = (tx.outputs as Array<Record<string, unknown>>)
+          .filter((output) => {
             const covenant = output.covenant as Record<string, unknown> | undefined;
-            return String(covenant?.action || '').toUpperCase() === 'TRANSFER'
-              && normalizeHnsAddress(String(output.address || '')) === buyer;
+            if (String(covenant?.action || '').toUpperCase() !== 'TRANSFER') {
+              return false;
+            }
+            if (!nameHash) return true;
+            const items = covenant?.items;
+            return Array.isArray(items)
+              && String(items[0] || '').toLowerCase() === nameHash;
           });
-          if (matched) {
-            const txHeight = Number(tx.height ?? 0);
-            const txConfirmations = Number(tx.confirmations ?? 0);
-            transferConfirmed = txHeight > 0 || txConfirmations > 0;
-          }
+        if (transferOutputs.length === 0) return null;
+
+        const matchesBuyer = transferOutputs.some((output) => {
+          const covenant = output.covenant as Record<string, unknown> | undefined;
+          return covenantItemsMatchAddress(covenant?.items, buyer);
+        });
+        return { hash, tx, matchesBuyer };
+      };
+
+      // hsd keeps a transferring name in CLOSED state. `transfer` is the
+      // height that started the lockup, and the current owner is the transfer
+      // output. That output still pays the seller; the intended recipient is
+      // encoded in the TRANSFER covenant's address items.
+      if (transferHeight > 0) {
+        const ownerHash = String(owner?.hash || '');
+        const candidates = Array.from(
+          new Set([ownerHash, transferTxHash || ''].filter(Boolean)),
+        );
+
+        let inspected: Awaited<ReturnType<typeof inspectTransferTx>> = null;
+        for (const hash of candidates) {
+          inspected = await inspectTransferTx(hash);
+          if (inspected) break;
+        }
+
+        if (!inspected) {
+          // The name is in transfer, but the recipient could not be verified.
+          // Stay pending rather than letting the buyer pay an unverified trade.
+          return {
+            transferred: false,
+            cancelled: false,
+            finalized: false,
+            transferHeight,
+            transferTxHash: transferTxHash || ownerHash || undefined,
+          };
+        }
+
+        if (!inspected.matchesBuyer) {
+          // The name is being transferred to a different recipient.
+          return {
+            transferred: false,
+            cancelled: true,
+            finalized: false,
+            transferTxHash: inspected.hash,
+            transferHeight,
+          };
+        }
+
+        const lockup = TRANSFER_LOCKUP_BLOCKS[network] ?? TRANSFER_LOCKUP_BLOCKS.main;
+        const finalizableHeight = transferHeight + lockup;
+        const blocksRemaining = Math.max(0, finalizableHeight - currentHeight);
+
+        return {
+          transferred: true,
+          cancelled: false,
+          finalized: false,
+          transferTxHash: inspected.hash,
+          transferHeight,
+          blocksRemaining,
+          estimatedMinutesRemaining: blocksRemaining * BLOCK_MINUTES,
+        };
+      }
+
+      // `transfer` is zero after finalize or cancel. Resolve the owner coin to
+      // distinguish "buyer now owns the name" from "seller still owns it".
+      let ownerAddr = '';
+      if (owner?.hash && owner.index != null) {
+        try {
+          const coin = await nodeClient.getCoin(owner.hash, owner.index) as Record<string, unknown> | null;
+          ownerAddr = normalizeHnsAddress(String(coin?.address || ''));
+        } catch {
+          // Leave unknown; treat as not finalized.
         }
       }
 
-      // Fall back to the buyer's wallet history if the tx lookup fails or the
-      // seller published an intent before transfer txids were included.
+      if (state === 'REVOKED' || state === 'EXPIRED' || info.expired === true) {
+        return {
+          transferred: false,
+          cancelled: true,
+          finalized: false,
+          transferHeight: undefined,
+        };
+      }
+
+      if (ownerAddr && ownerAddr === buyer) {
+        return {
+          transferred: false,
+          cancelled: false,
+          finalized: true,
+          transferTxHash: transferTxHash || undefined,
+        };
+      }
+
+      // A completed transfer that no longer exists was cancelled. Require the
+      // transfer transaction to be confirmed and to have targeted this buyer.
+      let matchedTxHash = '';
+      let matched = false;
+      let transferConfirmed = false;
+
+      if (transferTxHash) {
+        const inspected = await inspectTransferTx(transferTxHash);
+        if (inspected?.matchesBuyer) {
+          matchedTxHash = inspected.hash;
+          matched = true;
+          const txHeight = Number(inspected.tx.height ?? 0);
+          const txConfirmations = Number(inspected.tx.confirmations ?? 0);
+          transferConfirmed = txHeight > 0 || txConfirmations > 0;
+        }
+      }
+
+      // Fall back to the buyer's wallet history if the seller published an
+      // intent before transfer txids were included.
       if (!matched) {
         try {
           const history = await this.walletService.getTxHistory();
           const hit = history.find((tx) =>
-            tx.outputs.some((output) =>
-              normalizeHnsAddress(output.address) === buyer
-              && String(output.covenant.action || '').toUpperCase() === 'TRANSFER',
-            ),
+            tx.outputs.some((output) => {
+              if (String(output.covenant.action || '').toUpperCase() !== 'TRANSFER') {
+                return false;
+              }
+              const items = (output.covenant as unknown as Record<string, unknown>).items;
+              if (nameHash) {
+                if (!Array.isArray(items)
+                  || String(items[0] || '').toLowerCase() !== nameHash) {
+                  return false;
+                }
+              }
+              return covenantItemsMatchAddress(items, buyer);
+            }),
           );
           if (hit) {
             matchedTxHash = hit.hash;
@@ -1295,68 +1416,11 @@ export class MarketplaceService {
         }
       }
 
-      if (state === 'CLOSED' || state === 'REVOKED' || state === 'EXPIRED') {
-        let ownerAddr = '';
-        const owner = info.owner as { hash?: string; index?: number } | undefined;
-        if (owner?.hash && owner.index != null) {
-          try {
-            const coin = await nodeClient.execute('getcoin', [owner.hash, owner.index]) as Record<string, unknown> | null;
-            ownerAddr = normalizeHnsAddress(String(coin?.address || ''));
-          } catch {
-            // Leave unknown; treat as not finalized.
-          }
-        }
-        const finalized = Boolean(ownerAddr && ownerAddr === buyer);
-        if (finalized) {
-          return {
-            transferred: false,
-            cancelled: false,
-            finalized: true,
-            transferTxHash: matchedTxHash || undefined,
-            transferHeight: transferHeight || undefined,
-          };
-        }
-
-        // A CLOSED name is the normal state before the seller's transfer is
-        // mined. Only report a cancellation when a transfer to this buyer was
-        // actually confirmed and the name is no longer in TRANSFER state.
-        const unavailable = state === 'REVOKED' || state === 'EXPIRED';
-        return {
-          transferred: false,
-          cancelled: unavailable || (matched && transferConfirmed),
-          finalized: false,
-          transferTxHash: matchedTxHash || undefined,
-          transferHeight: transferHeight || undefined,
-        };
-      }
-
-      if (state !== 'TRANSFER' && state !== 'CLAIMING') {
-        return { transferred: false, cancelled: false, finalized: false };
-      }
-
-      if (!matched) {
-        return {
-          transferred: false,
-          cancelled: false,
-          finalized: false,
-          transferHeight: transferHeight || undefined,
-        };
-      }
-
-      const lockup = TRANSFER_LOCKUP_BLOCKS[network] ?? TRANSFER_LOCKUP_BLOCKS.main;
-      const finalizableHeight = transferHeight
-        ? transferHeight + lockup
-        : currentHeight + lockup;
-      const blocksRemaining = Math.max(0, finalizableHeight - currentHeight);
-
       return {
-        transferred: true,
-        cancelled: false,
+        transferred: false,
+        cancelled: Boolean(matched && transferConfirmed),
         finalized: false,
-        transferTxHash: matchedTxHash,
-        transferHeight: transferHeight || undefined,
-        blocksRemaining,
-        estimatedMinutesRemaining: blocksRemaining * BLOCK_MINUTES,
+        transferTxHash: matchedTxHash || undefined,
       };
     } catch {
       return { transferred: false, cancelled: false, finalized: false };

@@ -40,7 +40,9 @@ function secretForPubkey(pubkey: string): Uint8Array {
   if (pubkey === ARBITER_PUBKEY) return ARBITER_SECRET;
   throw new Error('No test secret for pubkey');
 }
-const CREATED = '2026-10-25T10:00:00.000Z';
+// Keep listings valid regardless of the wall clock. A fixed past timestamp
+// makes these tests fail as soon as the listing expiry window elapses.
+const CREATED = new Date(Date.now() - 60_000).toISOString();
 const EXPIRES = getListingExpiresAt(CREATED);
 
 function makeAddress(seed: number): string {
@@ -51,6 +53,36 @@ function makeAddress(seed: number): string {
 const SELLER_ADDR = makeAddress(1);
 const BUYER_ADDR = makeAddress(2);
 const ARBITER_PAYOUT_ADDR = makeAddress(3);
+
+function transferCovenantItems(
+  recipient: string,
+  nameHash = '11'.repeat(32),
+): string[] {
+  const decoded = bech32.decode(recipient, 90);
+  const program = bech32.fromWords(decoded.words.slice(1));
+  return [
+    nameHash,
+    '00000384',
+    decoded.words[0].toString(16).padStart(2, '0'),
+    program.map((byte) => byte.toString(16).padStart(2, '0')).join(''),
+  ];
+}
+
+function makeTransferTransaction(
+  recipient: string,
+  nameHash = '11'.repeat(32),
+): Record<string, unknown> {
+  return {
+    // hsd pays the transfer coin back to the seller. The buyer is encoded in
+    // the TRANSFER covenant, not in the output address.
+    outputs: [{
+      address: SELLER_ADDR,
+      covenant: { action: 'TRANSFER', items: transferCovenantItems(recipient, nameHash) },
+    }],
+    height: 900,
+    confirmations: 2,
+  };
+}
 
 function makeListing(overrides: Partial<MarketplaceListing> = {}): MarketplaceListing {
   const listingId = getListingId(SELLER_PUBKEY, 'example');
@@ -252,6 +284,7 @@ function makeHarness(options: {
 
   const nodeClient = {
     execute,
+    getCoin: vi.fn(async () => ({ address: ownerAddress })),
     getInfo: vi.fn(async () => ({
       network: 'main',
       chain: { height: 1000 },
@@ -264,18 +297,19 @@ function makeHarness(options: {
 
   let receivedIntents: PurchaseIntent[] = [];
   const signMessageWithName = vi.fn(options.sign ?? (async () => 'seller-signature'));
-  let transaction: Record<string, unknown> = {
-    outputs: options.transferOutputs ?? [
-      { address: BUYER_ADDR, covenant: { action: 'TRANSFER' } },
-    ],
-  };
-  const getTransaction = vi.fn(async () => transaction);
+  let transaction: Record<string, unknown> = options.transferOutputs
+    ? { outputs: options.transferOutputs }
+    : makeTransferTransaction(BUYER_ADDR);
+  const transactionOverrides = new Map<string, Record<string, unknown>>();
+  const getTransaction = vi.fn(async (hash: string) =>
+    transactionOverrides.get(hash) ?? transaction);
 
+  let txHistory: unknown[] = [];
   const walletService = {
     getAddress: vi.fn(async () => ({ address: SELLER_ADDR })),
     signMessageWithName,
     getTransaction,
-    getTxHistory: vi.fn(async () => []),
+    getTxHistory: vi.fn(async () => txHistory),
     sendToAddress: vi.fn(async () => ({ hash: 'pay-tx', fee: 12_345 })),
     sendTransfer: vi.fn(async () => ({ hash: 'transfer-tx' })),
     sendFinalize: vi.fn(async () => ({ hash: 'finalize-tx' })),
@@ -327,6 +361,10 @@ function makeHarness(options: {
     setNameInfo: (value: Record<string, unknown>) => { nameInfo = value; },
     setOwnerAddress: (value: string) => { ownerAddress = value; },
     setTransaction: (value: Record<string, unknown>) => { transaction = value; },
+    setTransactionFor: (hash: string, value: Record<string, unknown>) => {
+      transactionOverrides.set(hash, value);
+    },
+    setTxHistory: (value: unknown[]) => { txHistory = value; },
     setSetting: (key: string, value: string) => { settings[key] = value; },
     setReceivedIntents: (value: PurchaseIntent[]) => { receivedIntents = value; },
   };
@@ -414,11 +452,17 @@ describe('MarketplaceService', () => {
     ).rejects.toThrow(/address/i);
   });
 
-  it('detects a transfer and computes the remaining lockup', async () => {
+  it('detects an active transfer from CLOSED + transfer height', async () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
-      nameInfo: { state: 'TRANSFER', transfer: 900, owner: { hash: '00', index: 0 } },
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 900,
+        owner: { hash: 'transfer-tx', index: 0 },
+      },
+      ownerAddress: SELLER_ADDR,
     });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(BUYER_ADDR));
 
     const status = await h.service.checkTransferStatus(
       'example',
@@ -427,15 +471,35 @@ describe('MarketplaceService', () => {
     );
 
     expect(status.transferred).toBe(true);
+    expect(status.finalized).toBe(false);
+    expect(status.cancelled).toBe(false);
     expect(status.transferTxHash).toBe('transfer-tx');
     expect(status.transferHeight).toBe(900);
     expect(status.blocksRemaining).toBe(188); // 900 + 288 - 1000
   });
 
-  it('reports a finalized name when the current owner is the buyer', async () => {
+  it('finds the transfer through the owner outpoint without a Nostr txid', async () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
-      nameInfo: { state: 'CLOSED', transfer: 900, owner: { hash: '00', index: 0 } },
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 900,
+        owner: { hash: 'transfer-tx', index: 0 },
+      },
+      ownerAddress: SELLER_ADDR,
+    });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(BUYER_ADDR));
+
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
+
+    expect(status.transferred).toBe(true);
+    expect(status.transferTxHash).toBe('transfer-tx');
+  });
+
+  it('reports a finalized name only after the transfer field is cleared', async () => {
+    const h = makeHarness({
+      ourPubKey: BUYER_PUBKEY,
+      nameInfo: { state: 'CLOSED', transfer: 0, owner: { hash: 'finalize-tx', index: 0 } },
       ownerAddress: BUYER_ADDR,
     });
 
@@ -445,39 +509,47 @@ describe('MarketplaceService', () => {
     expect(status.cancelled).toBe(false);
   });
 
+  it('does not treat a mid-transfer name as finalized just because the owner coin exists', async () => {
+    const h = makeHarness({
+      ourPubKey: BUYER_PUBKEY,
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 900,
+        owner: { hash: 'transfer-tx', index: 0 },
+      },
+      // hsd pays the transfer coin to the seller while the covenant names the
+      // buyer. This must not be mistaken for a finalized name.
+      ownerAddress: SELLER_ADDR,
+    });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(BUYER_ADDR));
+
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
+
+    expect(status.transferred).toBe(true);
+    expect(status.finalized).toBe(false);
+  });
+
   it('does not report a normal CLOSED name as a cancelled transfer', async () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
-      nameInfo: { state: 'CLOSED', transfer: 900, owner: { hash: '00', index: 0 } },
+      nameInfo: { state: 'CLOSED', transfer: 0, owner: { hash: '00', index: 0 } },
     });
     h.setOwnerAddress(SELLER_ADDR);
-    h.setTransaction({
-      outputs: [{ address: BUYER_ADDR, covenant: { action: 'TRANSFER' } }],
-      // No height/confirmations: the seller's transfer is still pending.
-    });
 
-    const status = await h.service.checkTransferStatus(
-      'example',
-      BUYER_ADDR,
-      'transfer-tx',
-    );
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
 
     expect(status.transferred).toBe(false);
     expect(status.cancelled).toBe(false);
     expect(status.finalized).toBe(false);
   });
 
-  it('reports a cancelled transfer only after the transfer was confirmed', async () => {
+  it('reports a cancelled transfer after a confirmed transfer was cancelled', async () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
-      nameInfo: { state: 'CLOSED', transfer: 900, owner: { hash: '00', index: 0 } },
+      nameInfo: { state: 'CLOSED', transfer: 0, owner: { hash: '00', index: 0 } },
     });
     h.setOwnerAddress(SELLER_ADDR);
-    h.setTransaction({
-      outputs: [{ address: BUYER_ADDR, covenant: { action: 'TRANSFER' } }],
-      height: 900,
-      confirmations: 2,
-    });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(BUYER_ADDR));
 
     const status = await h.service.checkTransferStatus(
       'example',
@@ -489,11 +561,84 @@ describe('MarketplaceService', () => {
     expect(status.cancelled).toBe(true);
   });
 
+  it('finds a cancelled transfer for this name in wallet history', async () => {
+    const h = makeHarness({
+      ourPubKey: BUYER_PUBKEY,
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 0,
+        nameHash: '11'.repeat(32),
+        owner: { hash: '00', index: 0 },
+      },
+    });
+    h.setOwnerAddress(SELLER_ADDR);
+    h.setTxHistory([{
+      hash: 'transfer-tx',
+      height: 900,
+      outputs: [{
+        address: SELLER_ADDR,
+        covenant: { action: 'TRANSFER', items: transferCovenantItems(BUYER_ADDR) },
+      }],
+    }]);
+
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
+
+    expect(status.cancelled).toBe(true);
+    expect(status.transferTxHash).toBe('transfer-tx');
+  });
+
+  it('ignores an unrelated transfer to the same buyer in wallet history', async () => {
+    const h = makeHarness({
+      ourPubKey: BUYER_PUBKEY,
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 0,
+        nameHash: '11'.repeat(32),
+        owner: { hash: '00', index: 0 },
+      },
+    });
+    h.setOwnerAddress(SELLER_ADDR);
+    h.setTxHistory([{
+      hash: 'other-name-transfer',
+      height: 900,
+      outputs: [{
+        address: SELLER_ADDR,
+        covenant: {
+          action: 'TRANSFER',
+          items: transferCovenantItems(BUYER_ADDR, '22'.repeat(32)),
+        },
+      }],
+    }]);
+
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
+
+    expect(status.transferred).toBe(false);
+    expect(status.cancelled).toBe(false);
+    expect(status.finalized).toBe(false);
+  });
+
+  it('reports a transfer to another recipient as no longer available', async () => {
+    const h = makeHarness({
+      ourPubKey: BUYER_PUBKEY,
+      nameInfo: {
+        state: 'CLOSED',
+        transfer: 900,
+        owner: { hash: 'transfer-tx', index: 0 },
+      },
+      ownerAddress: SELLER_ADDR,
+    });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(ARBITER_PAYOUT_ADDR));
+
+    const status = await h.service.checkTransferStatus('example', BUYER_ADDR);
+
+    expect(status.transferred).toBe(false);
+    expect(status.cancelled).toBe(true);
+  });
+
   it('waits instead of claiming cancellation when Pay seller is clicked early', async () => {
     const h = makeHarness({ ourPubKey: BUYER_PUBKEY });
     const intent = await h.service.requestPurchase(makeListing(), BUYER_ADDR);
     intent.status = 'transferred';
-    intent.transferTxHash = 'transfer-tx';
 
     await expect(
       h.service.confirmAndPay(intent.intentId!, 'secret'),
@@ -504,7 +649,7 @@ describe('MarketplaceService', () => {
   it('allows payment after the buyer already finalized the name', async () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
-      nameInfo: { state: 'CLOSED', transfer: 900, owner: { hash: '00', index: 0 } },
+      nameInfo: { state: 'CLOSED', transfer: 0, owner: { hash: 'finalize-tx', index: 0 } },
       ownerAddress: BUYER_ADDR,
     });
     const intent = await h.service.requestPurchase(makeListing(), BUYER_ADDR);
@@ -583,7 +728,12 @@ describe('MarketplaceService', () => {
     const intent = await h.service.requestPurchase(listing, BUYER_ADDR);
 
     // The seller approves after the request: the name is now transferring.
-    h.setNameInfo({ state: 'TRANSFER', transfer: 900, owner: { hash: '00', index: 0 } });
+    h.setNameInfo({
+      state: 'CLOSED',
+      transfer: 900,
+      owner: { hash: 'transfer-tx', index: 0 },
+    });
+    h.setTransactionFor('transfer-tx', makeTransferTransaction(BUYER_ADDR));
     intent.status = 'transferred';
     intent.transferTxHash = 'transfer-tx';
 
@@ -705,7 +855,7 @@ describe('MarketplaceService', () => {
       ownerAddress: BUYER_ADDR,
       nameInfo: {
         state: 'CLOSED',
-        transfer: 900,
+        transfer: 0,
         owner: { hash: '00', index: 0 },
       },
     });
@@ -741,7 +891,7 @@ describe('MarketplaceService', () => {
       ownerAddress: BUYER_ADDR,
       nameInfo: {
         state: 'CLOSED',
-        transfer: 900,
+        transfer: 0,
         owner: { hash: '00', index: 0 },
       },
     });
@@ -769,7 +919,7 @@ describe('MarketplaceService', () => {
       ownerAddress: BUYER_ADDR,
       nameInfo: {
         state: 'CLOSED',
-        transfer: 900,
+        transfer: 0,
         owner: { hash: '00', index: 0 },
       },
     });
@@ -829,8 +979,8 @@ describe('MarketplaceService', () => {
     const h = makeHarness({
       ourPubKey: BUYER_PUBKEY,
       nameInfo: {
-        state: 'TRANSFER',
-        transfer: 900,
+        state: 'CLOSED',
+        transfer: 0,
         owner: { hash: '00', index: 0 },
       },
     });
@@ -910,8 +1060,8 @@ describe('MarketplaceService', () => {
     const intent = await h.service.requestPurchase(listing, BUYER_ADDR, true);
 
     h.setNameInfo({
-      state: 'TRANSFER',
-      transfer: 900,
+      state: 'CLOSED',
+      transfer: 0,
       owner: { hash: '00', index: 0 },
     });
     intent.status = 'transferred';
